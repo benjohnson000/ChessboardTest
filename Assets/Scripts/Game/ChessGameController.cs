@@ -1,9 +1,15 @@
 /*
 Algorithm:
 This controller runs the chessboard state machine.
-It creates a platform-appropriate engine: Stockfish on desktop/editor,
-and a random legal-move fallback on WebGL. This allows browser builds
-to work without requiring the user to install Stockfish.
+It uses popup buttons for confirm/error/promotion actions, resolves player moves from
+physical occupancy, drives engine moves, and waits for board synchronization when needed.
+When the board is in an error state, it highlights all mismatched squares in red so the
+user can immediately see what needs fixing.
+
+This version includes:
+- robust move-session tracking
+- castling-safe hinting
+- capture-safe fallback resolution for fork situations and varied physical move ordering
 */
 
 using System.Collections;
@@ -26,9 +32,9 @@ public class ChessGameController : MonoBehaviour
     private PhysicalBoardSnapshot latestSnapshot;
     private ChessMove pendingPlayerMove;
     private ChessMove pendingEngineMove;
-    private PromotionChoice currentPromotionChoice = PromotionChoice.Queen;
 
     private bool pendingGameEndCheckAfterBoardSync;
+    private readonly PlayerMoveSession playerMoveSession = new PlayerMoveSession();
 
     private IEnumerator Start()
     {
@@ -81,7 +87,6 @@ public class ChessGameController : MonoBehaviour
                 break;
 
             case GameFlowState.PromotionSelection:
-                TickPromotionSelection();
                 break;
 
             case GameFlowState.EngineThinking:
@@ -129,7 +134,7 @@ public class ChessGameController : MonoBehaviour
     private void EnterSetupBoardState()
     {
         state = GameFlowState.SetupBoard;
-        display.ShowMessage("Setup Board", "Place pieces in starting position.");
+        display.ShowStatus("Setup board in starting position.");
     }
 
     private void TickSetupBoardState()
@@ -141,16 +146,17 @@ public class ChessGameController : MonoBehaviour
 
         if (matches)
         {
-            display.ShowStatus("Board ready. Press confirm to start.");
+            display.ShowStatus("Board ready. Press confirm to start.", OnConfirmButtonClicked);
 
             if (hardware.ConsumeConfirmPressed())
             {
+                display.HidePopup();
                 StartPlayerTurn();
             }
         }
         else
         {
-            display.ShowMessage("Setup Board", "Fix highlighted squares.");
+            display.ShowStatus("Fix highlighted squares.");
         }
     }
 
@@ -178,13 +184,18 @@ public class ChessGameController : MonoBehaviour
 
     private void StartPlayerTurn()
     {
+        playerMoveSession.Reset();
+
         state = GameFlowState.WaitingForPlayerBoardChange;
-        display.ShowStatus("Your turn. Move piece, then press confirm.");
+        display.ShowStatus("Your turn. Move piece, then press confirm.", OnConfirmButtonClicked);
         RefreshPlayerTurnLeds();
     }
 
     private void TickWaitingForPlayerBoardChange()
     {
+        PhysicalBoardSnapshot expected = chessCore.GetExpectedOccupancySnapshot();
+        UpdatePlayerMoveSession(expected, latestSnapshot);
+
         RefreshPlayerTurnLeds();
 
         if (hardware.ConsumeConfirmPressed())
@@ -195,6 +206,9 @@ public class ChessGameController : MonoBehaviour
 
     private void TickWaitingForPlayerConfirm()
     {
+        PhysicalBoardSnapshot expected = chessCore.GetExpectedOccupancySnapshot();
+        UpdatePlayerMoveSession(expected, latestSnapshot);
+
         RefreshPlayerTurnLeds();
 
         if (hardware.ConsumeConfirmPressed())
@@ -205,14 +219,11 @@ public class ChessGameController : MonoBehaviour
 
     private void RefreshPlayerTurnLeds()
     {
-        PhysicalBoardSnapshot expected = chessCore.GetExpectedOccupancySnapshot();
         List<ChessMove> legalMoves = chessCore.GetLegalMoves();
 
-        BoardSquare? pickedUpSquare = TryGetPickedUpSquare(expected, latestSnapshot);
-
-        if (pickedUpSquare.HasValue)
+        if (playerMoveSession.SourceSquare.HasValue)
         {
-            ledAnimator.ShowLegalDestinations(pickedUpSquare.Value, legalMoves);
+            ledAnimator.ShowLegalDestinations(playerMoveSession.SourceSquare.Value, legalMoves);
         }
         else
         {
@@ -226,36 +237,104 @@ public class ChessGameController : MonoBehaviour
         }
     }
 
-    private BoardSquare? TryGetPickedUpSquare(PhysicalBoardSnapshot expected, PhysicalBoardSnapshot actual)
+    /*
+    Algorithm:
+    This tracks live hints about the player's physical move.
+
+    It is intentionally conservative:
+    - if exactly one expected square is missing, that is a strong source hint
+    - if multiple expected squares are missing, do not guess source too early unless it was already known
+    - create a capture hint when the board shape looks like a capture in progress
+
+    Important:
+    For a real capture, the key intermediate states may be:
+    1) source removed, captured piece still present
+    2) source removed, captured piece removed
+    3) source placed on target square
+
+    Step 2 produces:
+    - 2 missing expected occupied squares
+    - 0 newly occupied squares
+
+    So we must treat both newlyOccupied == 0 and newlyOccupied == 1 as valid capture-hint states.
+    */
+    private void UpdatePlayerMoveSession(PhysicalBoardSnapshot expected, PhysicalBoardSnapshot actual)
     {
-        List<BoardSquare> missingExpectedPieces = new List<BoardSquare>();
+        List<BoardSquare> missingExpectedSquares = new List<BoardSquare>();
+        List<BoardSquare> newlyOccupiedSquares = new List<BoardSquare>();
 
         for (int rank = 0; rank < 8; rank++)
         {
             for (int file = 0; file < 8; file++)
             {
-                if (expected[rank, file] && !actual[rank, file])
+                bool shouldBeOccupied = expected[rank, file];
+                bool isOccupied = actual[rank, file];
+
+                if (shouldBeOccupied && !isOccupied)
                 {
-                    missingExpectedPieces.Add(new BoardSquare(rank, file));
+                    missingExpectedSquares.Add(new BoardSquare(rank, file));
+                }
+                else if (!shouldBeOccupied && isOccupied)
+                {
+                    newlyOccupiedSquares.Add(new BoardSquare(rank, file));
                 }
             }
         }
 
-        if (missingExpectedPieces.Count == 1)
-            return missingExpectedPieces[0];
+        // Board matches expected again.
+        if (missingExpectedSquares.Count == 0 && newlyOccupiedSquares.Count == 0)
+        {
+            playerMoveSession.Reset();
+            return;
+        }
 
-        return null;
+        // Strong source hint: exactly one expected occupied square is now empty.
+        if (missingExpectedSquares.Count == 1)
+        {
+            playerMoveSession.SetSource(missingExpectedSquares[0]);
+        }
+
+        // Capture-in-progress shape:
+        // - source removed
+        // - captured piece removed
+        // - optionally destination already re-occupied by moving piece
+        //
+        // This means:
+        // - 2 expected occupied squares are missing
+        // - 0 or 1 new square is occupied
+        //
+        // Castling is not this shape once completed, because it creates 2 newly occupied squares.
+        if (missingExpectedSquares.Count == 2 && newlyOccupiedSquares.Count <= 1)
+        {
+            if (playerMoveSession.SourceSquare.HasValue)
+            {
+                foreach (BoardSquare square in missingExpectedSquares)
+                {
+                    if (square != playerMoveSession.SourceSquare.Value)
+                    {
+                        playerMoveSession.SetCaptureHint(square);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     private void ResolvePlayerMove()
     {
-        bool success = moveResolver.TryResolveMove(chessCore, latestSnapshot, out ChessMove resolvedMove, out bool requiresPromotionChoice);
+        bool success = moveResolver.TryResolveMove(
+            chessCore,
+            latestSnapshot,
+            out ChessMove resolvedMove,
+            out bool requiresPromotionChoice,
+            playerMoveSession.SourceSquare,
+            playerMoveSession.CaptureSquareHint);
 
         if (!success)
         {
             state = GameFlowState.Error;
-            display.ShowError("Could not resolve move. Check board and press confirm.");
-            ledAnimator.ShowErrorCorners();
+            display.ShowError("Could not resolve move. Fix highlighted squares and press confirm.", OnConfirmButtonClicked);
+            ShowBoardMismatchLeds();
             return;
         }
 
@@ -265,43 +344,47 @@ public class ChessGameController : MonoBehaviour
         {
             if (settings.AutoQueenPromotion)
             {
-                pendingPlayerMove = new ChessMove(pendingPlayerMove.From, pendingPlayerMove.To, MoveSpecialType.Promotion, PromotionChoice.Queen);
+                pendingPlayerMove = new ChessMove(
+                    pendingPlayerMove.From,
+                    pendingPlayerMove.To,
+                    MoveSpecialType.Promotion,
+                    PromotionChoice.Queen);
+
                 CommitPlayerMove();
                 return;
             }
 
-            currentPromotionChoice = PromotionChoice.Queen;
             state = GameFlowState.PromotionSelection;
-            display.ShowPromotionChoice(currentPromotionChoice);
             ledAnimator.ShowPromotionSquare(pendingPlayerMove.To);
+
+            display.ShowPromotionMenu(
+                () => OnPromotionSelected(PromotionChoice.Queen),
+                () => OnPromotionSelected(PromotionChoice.Rook),
+                () => OnPromotionSelected(PromotionChoice.Bishop),
+                () => OnPromotionSelected(PromotionChoice.Knight)
+            );
+
             return;
         }
 
         CommitPlayerMove();
     }
 
-    private void TickPromotionSelection()
+    private void OnPromotionSelected(PromotionChoice choice)
     {
-        if (hardware.ConsumeConfirmPressed())
-        {
-            currentPromotionChoice = NextPromotion(currentPromotionChoice);
-            display.ShowPromotionChoice(currentPromotionChoice);
+        pendingPlayerMove = new ChessMove(
+            pendingPlayerMove.From,
+            pendingPlayerMove.To,
+            MoveSpecialType.Promotion,
+            choice);
 
-            pendingPlayerMove = new ChessMove(
-                pendingPlayerMove.From,
-                pendingPlayerMove.To,
-                MoveSpecialType.Promotion,
-                currentPromotionChoice);
-        }
-    }
-
-    public void AcceptPromotionChoice()
-    {
         CommitPlayerMove();
     }
 
     private void CommitPlayerMove()
     {
+        display.HidePopup();
+
         chessCore.ApplyMove(pendingPlayerMove);
 
         if (CheckForGameEnd())
@@ -317,8 +400,8 @@ public class ChessGameController : MonoBehaviour
         if (engine == null)
         {
             state = GameFlowState.Error;
-            display.ShowError("Engine unavailable.");
-            ledAnimator.ShowErrorCorners();
+            display.ShowError("Engine unavailable.", OnConfirmButtonClicked);
+            ShowBoardMismatchLeds();
             return;
         }
 
@@ -326,13 +409,12 @@ public class ChessGameController : MonoBehaviour
         chessCore.ApplyMove(pendingEngineMove);
 
         ledAnimator.ShowMove(pendingEngineMove);
-        display.ShowEngineInfo($"Engine move: {pendingEngineMove}");
+        display.ShowStatus($"Engine move: {pendingEngineMove}. Press confirm after updating the board.", OnConfirmButtonClicked);
 
         if (settings.RequireBoardSyncAfterEngineMove)
         {
             pendingGameEndCheckAfterBoardSync = true;
             state = GameFlowState.WaitingForBoardToMatchEngineMove;
-            display.ShowStatus("Make the engine move on the board, then press confirm.");
             return;
         }
 
@@ -350,8 +432,8 @@ public class ChessGameController : MonoBehaviour
         if (!boardSyncService.IsBoardSynced(chessCore, latestSnapshot))
         {
             state = GameFlowState.Error;
-            display.ShowError("Board does not match expected engine move.");
-            ledAnimator.ShowErrorCorners();
+            display.ShowError("Board does not match expected engine move. Fix highlighted squares and press confirm.", OnConfirmButtonClicked);
+            ShowBoardMismatchLeds();
             return;
         }
 
@@ -363,6 +445,7 @@ public class ChessGameController : MonoBehaviour
                 return;
         }
 
+        display.HidePopup();
         StartPlayerTurn();
     }
 
@@ -373,12 +456,38 @@ public class ChessGameController : MonoBehaviour
 
         if (!boardSyncService.IsBoardSynced(chessCore, latestSnapshot))
         {
-            display.ShowError("Still out of sync.");
-            ledAnimator.ShowErrorCorners();
+            display.ShowError("Still out of sync. Fix highlighted squares and press confirm.", OnConfirmButtonClicked);
+            ShowBoardMismatchLeds();
             return;
         }
 
+        display.HidePopup();
         StartPlayerTurn();
+    }
+
+    private void ShowBoardMismatchLeds()
+    {
+        PhysicalBoardSnapshot expected = chessCore.GetExpectedOccupancySnapshot();
+        hardware.ClearAllLeds();
+
+        bool foundMismatch = false;
+
+        for (int rank = 0; rank < 8; rank++)
+        {
+            for (int file = 0; file < 8; file++)
+            {
+                if (expected[rank, file] != latestSnapshot[rank, file])
+                {
+                    hardware.SetLed(rank, file, LedTheme.Error);
+                    foundMismatch = true;
+                }
+            }
+        }
+
+        if (!foundMismatch)
+        {
+            ledAnimator.ShowErrorCorners();
+        }
     }
 
     private bool CheckForGameEnd()
@@ -386,40 +495,59 @@ public class ChessGameController : MonoBehaviour
         if (chessCore.IsCheckmate())
         {
             state = GameFlowState.GameOver;
-            display.ShowMessage("Game Over", "Checkmate");
-            ledAnimator.Clear();
+
+            PlayerSide losingSide = chessCore.SideToMove;
+            PlayerSide winningSide = losingSide == PlayerSide.White ? PlayerSide.Black : PlayerSide.White;
+
+            BoardSquare losingKing = chessCore.GetKingSquare(losingSide);
+            BoardSquare winningKing = chessCore.GetKingSquare(winningSide);
+
+            display.ShowMessage("Game Over", "Checkmate", ResetToNewGameSetup);
+            ledAnimator.ShowCheckmateKings(winningKing, losingKing);
             return true;
         }
 
         if (chessCore.IsStalemate())
         {
             state = GameFlowState.GameOver;
-            display.ShowMessage("Game Over", "Stalemate");
-            ledAnimator.Clear();
+
+            BoardSquare whiteKing = chessCore.GetKingSquare(PlayerSide.White);
+            BoardSquare blackKing = chessCore.GetKingSquare(PlayerSide.Black);
+
+            display.ShowMessage("Game Over", "Stalemate", ResetToNewGameSetup);
+            ledAnimator.ShowStalemateKings(whiteKing, blackKing);
             return true;
         }
 
         if (chessCore.IsDraw())
         {
             state = GameFlowState.GameOver;
-            display.ShowMessage("Game Over", "Draw");
-            ledAnimator.Clear();
+
+            BoardSquare whiteKing = chessCore.GetKingSquare(PlayerSide.White);
+            BoardSquare blackKing = chessCore.GetKingSquare(PlayerSide.Black);
+
+            display.ShowMessage("Game Over", "Draw", ResetToNewGameSetup);
+            ledAnimator.ShowStalemateKings(whiteKing, blackKing);
             return true;
         }
 
         return false;
     }
 
-    private PromotionChoice NextPromotion(PromotionChoice current)
+    private void ResetToNewGameSetup()
     {
-        return current switch
-        {
-            PromotionChoice.Queen => PromotionChoice.Rook,
-            PromotionChoice.Rook => PromotionChoice.Bishop,
-            PromotionChoice.Bishop => PromotionChoice.Knight,
-            _ => PromotionChoice.Queen
-        };
+        pendingPlayerMove = null;
+        pendingEngineMove = null;
+        pendingGameEndCheckAfterBoardSync = false;
+
+        playerMoveSession.Reset();
+
+        chessCore = ThirdPartyChessFactory.CreateStartingPositionAdapter();
+
+        hardware.ClearAllLeds();
+        EnterSetupBoardState();
     }
+
 
     private string GetStockfishPath()
     {

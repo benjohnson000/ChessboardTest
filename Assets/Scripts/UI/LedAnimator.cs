@@ -1,10 +1,3 @@
-/*
-Algorithm:
-This file centralizes LED colors and highlighting helpers.
-It can show ready patterns, selected-piece legal moves, engine moves,
-errors, promotions, and check indication.
-*/
-
 using System.Collections.Generic;
 
 public sealed class LedAnimator
@@ -97,5 +90,19 @@ public sealed class LedAnimator
             hardware.SetLed(i, i, LedTheme.Menu);
             hardware.SetLed(i, 7 - i, LedTheme.Menu);
         }
+    }
+
+    public void ShowCheckmateKings(BoardSquare winningKing, BoardSquare losingKing)
+    {
+        hardware.ClearAllLeds();
+        hardware.SetLed(winningKing.Rank, winningKing.File, LedTheme.WinKing);
+        hardware.SetLed(losingKing.Rank, losingKing.File, LedTheme.LoseKing);
+    }
+
+    public void ShowStalemateKings(BoardSquare whiteKing, BoardSquare blackKing)
+    {
+        hardware.ClearAllLeds();
+        hardware.SetLed(whiteKing.Rank, whiteKing.File, LedTheme.StalemateKing);
+        hardware.SetLed(blackKing.Rank, blackKing.File, LedTheme.StalemateKing);
     }
 }

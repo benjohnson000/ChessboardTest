@@ -12,4 +12,8 @@ public static class LedTheme
     public const string Check = "#FF0000";
     public const string Promotion = "#C060FF";
     public const string Menu = "#44DDFF";
+
+    public const string WinKing = "#00FF00";
+    public const string LoseKing = "#FF0000";
+    public const string StalemateKing = "#FFFF00";
 }

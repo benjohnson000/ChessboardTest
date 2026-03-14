@@ -9,18 +9,11 @@ public class SIM_BoardSpace : MonoBehaviour
 {
     [SerializeField] private SpriteRenderer led;
 
-    [SerializeField] private bool detecting;
-
     public static SIM_BoardSpace Create(Vector2 worldPosiiton)
     {
         SIM_BoardSpace bspace = Instantiate(Resources.Load<SIM_BoardSpace>("BoardSpace"), worldPosiiton, Quaternion.identity);
         bspace.SetLEDColor(Color.clear);
         return bspace;
-    }
-
-    private void Update()
-    {
-        detecting = CheckForGamePiece();
     }
 
     /// <summary>

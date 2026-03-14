@@ -1,8 +1,17 @@
 /*
 Algorithm:
-This class resolves the player’s move by comparing the physical board snapshot
+This class resolves the player's move by comparing the physical board snapshot
 to the result of every legal move from the current software position.
-If exactly one legal move matches the occupancy, that must be the move played.
+
+It tries multiple passes:
+1) use both source and capture hints
+2) use only source hint
+3) use no hints at all
+
+This makes the system much more robust for real physical move ordering, especially
+for captures where the player may remove the captured piece before or after moving
+their own piece. Castling still works because it can benefit from hints when valid,
+but the resolver no longer gets stuck if a hint was recorded incorrectly.
 */
 
 using System;
@@ -17,13 +26,63 @@ public sealed class PhysicalMoveResolver
         this.chessCoreFactory = chessCoreFactory;
     }
 
-    public bool TryResolveMove(IChessCore currentPosition, PhysicalBoardSnapshot realSnapshot, out ChessMove resolvedMove, out bool requiresPromotionChoice)
+    public bool TryResolveMove(
+        IChessCore currentPosition,
+        PhysicalBoardSnapshot realSnapshot,
+        out ChessMove resolvedMove,
+        out bool requiresPromotionChoice,
+        BoardSquare? sourceHint = null,
+        BoardSquare? captureHint = null)
+    {
+        // Pass 1: use full hints
+        if (TryResolveMoveInternal(currentPosition, realSnapshot, out resolvedMove, out requiresPromotionChoice, sourceHint, captureHint))
+            return true;
+
+        // Pass 2: use only source hint
+        if (sourceHint.HasValue && TryResolveMoveInternal(currentPosition, realSnapshot, out resolvedMove, out requiresPromotionChoice, sourceHint, null))
+            return true;
+
+        // Pass 3: no hints at all
+        if (TryResolveMoveInternal(currentPosition, realSnapshot, out resolvedMove, out requiresPromotionChoice, null, null))
+            return true;
+
+        resolvedMove = null;
+        requiresPromotionChoice = false;
+        return false;
+    }
+
+    private bool TryResolveMoveInternal(
+        IChessCore currentPosition,
+        PhysicalBoardSnapshot realSnapshot,
+        out ChessMove resolvedMove,
+        out bool requiresPromotionChoice,
+        BoardSquare? sourceHint,
+        BoardSquare? captureHint)
     {
         List<ChessMove> legalMoves = currentPosition.GetLegalMoves();
         List<ChessMove> matches = new List<ChessMove>();
 
         foreach (ChessMove move in legalMoves)
         {
+            if (sourceHint.HasValue && move.From != sourceHint.Value)
+                continue;
+
+            if (captureHint.HasValue)
+            {
+                bool isCastle =
+                    move.SpecialType == MoveSpecialType.CastleKingSide ||
+                    move.SpecialType == MoveSpecialType.CastleQueenSide;
+
+                bool usesCaptureHint =
+                    (move.SpecialType == MoveSpecialType.Capture && move.To == captureHint.Value) ||
+                    (move.SpecialType == MoveSpecialType.Promotion && move.To == captureHint.Value) ||
+                    (move.SpecialType == MoveSpecialType.EnPassant);
+
+                // Only filter by capture hint for actual capture-like moves.
+                if (!isCastle && !usesCaptureHint)
+                    continue;
+            }
+
             IChessCore copy = chessCoreFactory();
 
             if (copy is not ILoadableFen loadable)

@@ -1,14 +1,19 @@
-/*
-Algorithm:
-This defines the small screen interface used by the chess controller.
-The Unity sim and Raspberry Pi display can both implement this contract.
-*/
+using System;
 
 public interface IDisplay
 {
-    void ShowMessage(string title, string body);
-    void ShowStatus(string status);
-    void ShowError(string message);
-    void ShowPromotionChoice(PromotionChoice currentChoice);
+    void ShowMessage(string title, string body, Action onOk = null);
+
+    void ShowStatus(string status, Action onConfirm = null);
+
+    void ShowError(string message, Action onOk = null);
+
+    void ShowPromotionMenu(
+        Action onQueen,
+        Action onRook,
+        Action onBishop,
+        Action onKnight);
+
+    void HidePopup();
     void ShowEngineInfo(string info);
 }
